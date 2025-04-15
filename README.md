@@ -1,6 +1,6 @@
-# Turbo Data Availability Tools
+# Avail TurboDA Helper Tools
 
-This repository contains two shell scripts for interacting with the Turbo Data Availability (TurboDA) service:
+This repository contains two shell scripts for interacting with the Avail TurboDA service:
 
 ## turbo
 
