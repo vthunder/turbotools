@@ -1,0 +1,179 @@
+#!/bin/bash
+
+show_help() {
+    echo "Usage: $0 [GLOBAL OPTIONS]... <ACTION> [ACTION OPTIONS]..."
+    echo "  GLOBAL OPTIONS:"
+    echo "    -n, --network <network>  Network, turing or mainnet (default: turing)"
+    echo "    -k, --api-key <file>     API key file (default: ~/.turboda/key-<network>)"
+    echo "    -d, --do-nothing         Parse arguments but do nothing"
+    echo "    -v, --verbose            Enable verbose output"
+    echo "    -h, --help               Show this help message"
+    echo "  ACTIONS:"
+    echo "    submit <data>"
+    echo "    submit-raw <file>"
+    echo "    query <submission_id>"
+    echo "    query-data <submission_id>"
+    exit 0
+}
+
+# Constants & defaults
+base_url_mainnet='https://turbo-api.availproject.org'
+base_url_turing='https://staging.turbo-api.availproject.org'
+network="turing"
+do_nothing_flag=0
+verbose_flag=0
+
+while :; do
+    case "$1" in
+        -n | --network)
+            network="$2"
+            shift 2
+            ;;
+        -k | --api-key)
+            api_key_file="$2"
+            shift 2
+            ;;
+        -d | --do-nothing)
+            do_nothing_flag=1
+            shift
+            ;;
+        -v | --verbose)
+            verbose_flag=1
+            shift
+            ;;
+        -h | --help)
+            show_help
+            ;;
+        --) # End of options
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: Invalid option: $1" >&2
+            show_help
+            ;;
+        *) # No more options
+            break
+            ;;
+    esac
+done
+
+# Set variables that depend on inputs
+base_url_var="base_url_${network}"
+base_url=${!base_url_var}
+
+if [[ ! -n "$api_key_file" ]]; then
+    api_key_file="${HOME}/.turbo/key-${network}"
+fi
+api_key=`cat ${api_key_file}`
+
+# Parse command
+if [[ ! $# -gt 0 ]]; then
+    show_help
+fi
+
+action=""
+data=""
+data_file=""
+submission_id=""
+
+case "$1" in
+    submit)
+        action="submit"
+        path="/v1/submit_data"
+        data=`jq -n -r --arg string "$2" '$string | @json'`
+        [[ ! -n $data ]] && show_help
+        shift 2
+        ;;
+    submit-raw)
+        action="submit-raw"
+        path="/v1/submit_raw_data"
+        data_file=$2
+        [[ ! -n $data_file ]] && show_help
+        shift 2
+        ;;
+    query)
+        action="query"
+        submission_id=$2
+        path="/v1/get_submission_info?submission_id=${submission_id}"
+        [[ ! -n $submission_id ]] && show_help
+        shift 2
+        ;;
+    query-data)
+        action="query-data"
+        submission_id=$2
+        path="/v1/get_pre_image?submission_id=${submission_id}"
+        [[ ! -n $submission_id ]] && show_help
+        shift 2
+        ;;
+    *)
+        show_help
+        ;;
+esac
+
+# There shouldn't be any more arguments
+if [[ $# -gt 0 ]]; then
+    show_help
+fi
+
+if [[ $verbose_flag -eq 1 ]]; then
+    echo "Verbose mode enabled."
+    echo "Network: ${network}"
+    echo "Base TurboDA URL: ${base_url}"
+    echo "API Key File: ${api_key_file}"
+    echo "API Key: ${api_key}"
+    echo "Action: ${action}"
+    [[ "$action" = "submit" ]] && echo "Data: ${data}"
+    [[ "$action" = "submit-raw" ]] && echo "Data file (raw): ${data_file}"
+    [[ "$action" = "query" ]] && echo "Submission ID: ${submission_id}"
+    [[ "$action" = "query-data" ]] && echo "Submission ID: ${submission_id}"
+fi
+
+[[ $do_nothing_flag -eq 1 ]] && exit 0
+
+case "$action" in
+    submit)
+        [[ $verbose_flag -eq 1 ]] &&  set -o xtrace
+        curl -s -X POST "${base_url}${path}" \
+             -H "x-api-key: ${api_key}" \
+             -H 'Content-Type: application/json' \
+             -d "{\"data\": ${data} }"
+        echo
+        ;;
+    submit-raw)
+        [[ $verbose_flag -eq 1 ]] &&  set -o xtrace
+        # Save response body to temp file
+        response_body=$(mktemp)
+        status_code=$(curl -s -w "%{http_code}" -o "$response_body" -X POST "${base_url}${path}" \
+             -H "x-api-key: ${api_key}" \
+             -H 'Content-Type: application/octet-stream' \
+             --data-binary "@${data_file}")
+        
+        # Extract submission ID from JSON response
+        submission_id=$(cat "$response_body" | jq -r '.submission_id // empty' || echo "")
+        rm -f "$response_body"
+        
+        # Return JSON with both status code and submission ID
+        if [ "${status_code}" = "200" ] && [ -n "$submission_id" ]; then
+            echo "{\"status\": \"success\", \"http_code\": \"${status_code}\", \"submission_id\": \"${submission_id}\"}"
+        else
+            error=$(cat "$response_body" 2>/dev/null || echo "Unknown error")
+            echo "{\"status\": \"error\", \"http_code\": \"${status_code}\", \"error\": \"$error\"}"
+        fi
+        ;;
+    query)
+        [[ $verbose_flag -eq 1 ]] &&  set -o xtrace
+        curl -s -X GET "${base_url}${path}" \
+             -H "x-api-key: ${api_key}" \
+             -H 'Content-Type: application/json' | jq
+        ;;
+    query-data)
+        [[ $verbose_flag -eq 1 ]] &&  set -o xtrace
+        curl -s -X GET "${base_url}${path}" \
+             -H "x-api-key: ${api_key}" \
+             -H 'Content-Type: application/json'
+        ;;
+    *)
+        show_help
+        ;;
+esac

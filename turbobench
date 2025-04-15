@@ -1,0 +1,195 @@
+#!/bin/bash
+
+# Default values
+LOG_FILE="turbobench.log"
+NUM_COPIES=1
+PARALLEL_JOBS=1  # Default to serial execution
+
+show_help() {
+    echo "Usage: $0 [OPTIONS]"
+    echo "  -n, --num-copies <n>     Number of times to submit each chunk (default: 1)"
+    echo "  -k, --api-key <file>     API key file"
+    echo "  -v, --verbose            Enable verbose output"
+    echo "  -p, --parallel <n>       Number of chunks to submit in parallel (default: 1)"
+    echo "  -h, --help               Show this help message"
+    exit 0
+}
+
+# Parse command line arguments
+verbose_flag=0
+
+while :; do
+    case "$1" in
+        -n | --num-copies)
+            NUM_COPIES="$2"
+            shift 2
+            ;;
+        -k | --api-key)
+            api_key_file="$2"
+            shift 2
+            ;;
+        -v | --verbose)
+            verbose_flag=1
+            shift
+            ;;
+        -p | --parallel)
+            PARALLEL_JOBS="$2"
+            shift 2
+            ;;
+        -h | --help)
+            show_help
+            ;;
+        "")
+            break
+            ;;
+        *)
+            echo "Error: Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Get the directory containing this script
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+samples_dir="$script_dir/samples"
+
+# Initialize log file with headers
+echo "index,submit_time,response_time,status,submission_id" > "$LOG_FILE"
+
+# Function to submit a chunk and log results
+submit_chunk() {
+    local chunk_file=$1
+    local index=$2
+    local submit_time=$(date +%s.%N)
+    
+    if [ "$verbose_flag" = "1" ]; then
+        echo "Submitting chunk $index ($(stat -f%z "$chunk_file") bytes)" >&2
+    fi
+    
+    # Submit the chunk using turbo script
+    local turbo_args=()
+    [ -n "$api_key_file" ] && turbo_args+=("-k" "$api_key_file")
+    [ "$verbose_flag" = "1" ] && turbo_args+=("-v")
+    
+    # Get the last line of output which should be the JSON response
+    response=$("$script_dir/turbo" "${turbo_args[@]}" submit-raw "$chunk_file" | tail -n1)
+    local exit_code=$?
+    local response_time=$(date +%s.%N)
+    
+    if [ $exit_code -eq 0 ] && [ -n "$response" ]; then
+        # Check if response is valid JSON first
+        if echo "$response" | jq . >/dev/null 2>&1; then
+            status=$(echo "$response" | jq -r '.status')
+            http_code=$(echo "$response" | jq -r '.http_code')
+            if [ "$status" = "success" ]; then
+                submission_id=$(echo "$response" | jq -r '.submission_id')
+                status="success"
+            else
+                submission_id="none"
+                status="failed"
+                if [ "$verbose_flag" = "1" ]; then
+                    echo "Error: HTTP $http_code" >&2
+                    error=$(echo "$response" | jq -r '.error // empty')
+                    [ -n "$error" ] && echo "Details: $error" >&2
+                fi
+            fi
+        else
+            submission_id="none"
+            status="failed"
+            if [ "$verbose_flag" = "1" ]; then
+                echo "Error: Invalid JSON response" >&2
+                echo "$response" >&2
+            fi
+        fi
+    else
+        submission_id="none"
+        status="failed"
+        if [ "$verbose_flag" = "1" ]; then
+            echo "Error: Script failed" >&2
+            echo "$response" >&2
+        fi
+    fi
+    
+    # Log the result (use macOS file locking)
+    (
+        # Try to acquire lock
+        while ! ln "$LOG_FILE" "$LOG_FILE.lock" 2>/dev/null; do
+            sleep 0.1
+        done
+        
+        # Append to log file
+        echo "$index,$submit_time,$response_time,$status,$submission_id" >> "$LOG_FILE"
+        
+        # Release lock
+        rm -f "$LOG_FILE.lock"
+    )
+    
+    if [ "$verbose_flag" = "1" ]; then
+        echo "Chunk $index: $status (ID: $submission_id)" >&2
+    fi
+}
+export -f submit_chunk  # Export for use with parallel/xargs
+
+echo "Will submit 7 files $NUM_COPIES time(s) with $PARALLEL_JOBS jobs in parallel..."
+chunk_index=0
+
+# Generate the list of tasks
+tasks_file=$(mktemp)
+for ((copy=0; copy<NUM_COPIES; copy++)); do
+    for i in {0..6}; do
+        chunk_file="$samples_dir/avail-$(printf "%02d" $i)"
+        if [ ! -f "$chunk_file" ]; then
+            echo "Error: Chunk file $chunk_file not found" >&2
+            rm -f "$tasks_file"
+            exit 1
+        fi
+        echo "$chunk_file $chunk_index"
+        ((chunk_index++))
+    done
+done > "$tasks_file"
+
+# Export variables needed by submit_chunk
+export script_dir api_key_file verbose_flag LOG_FILE samples_dir
+
+# Try GNU Parallel first, fall back to xargs
+if command -v parallel >/dev/null 2>&1; then
+    parallel -j "$PARALLEL_JOBS" --colsep ' ' submit_chunk {1} {2} < "$tasks_file"
+else
+    # If parallel isn't available, use xargs
+    xargs -P "$PARALLEL_JOBS" -L 1 bash -c 'submit_chunk $0 $1' < "$tasks_file"
+fi
+
+rm -f "$tasks_file"
+
+echo "Benchmark complete. Results written to $LOG_FILE"
+echo "Total chunks submitted: $chunk_index"
+
+# Calculate summary statistics
+echo -e "\nSummary:"
+echo "--------"
+
+# Get first and last timestamps
+first_submit=$(head -n2 "$LOG_FILE" | tail -n1 | cut -d',' -f2)
+last_response=$(tail -n1 "$LOG_FILE" | cut -d',' -f3)
+
+# Calculate total time
+total_seconds=$(echo "$last_response - $first_submit" | bc)
+echo "Total time: $(printf "%.2f" $total_seconds) seconds"
+
+# Calculate throughput
+total_bytes=0
+for i in {0..6}; do
+    chunk_file="$samples_dir/avail-$(printf "%02d" $i)"
+    bytes=$(stat -f%z "$chunk_file")
+    total_bytes=$((total_bytes + bytes))
+done
+
+mb_per_sec=$(echo "scale=2; $total_bytes / $total_seconds / 1048576" | bc)
+echo "Total size: $(printf "%.2f" $((total_bytes / 1048576))) MB"
+echo "Throughput: $mb_per_sec MB/s"
+
+# Count successes/failures
+successes=$(grep ",success," "$LOG_FILE" | wc -l)
+failures=$(grep ",failed," "$LOG_FILE" | wc -l)
+echo "Successful submissions: $successes"
+echo "Failed submissions: $failures"
